@@ -31,7 +31,7 @@
 //#define ACQ_BUFFER_SIZE (6000000)
 #define ACQ_BUFFER_SIZE (18000000)
 
-#define SIGLENT_HEADER_SIZE 363
+#define SIGLENT_HEADER_SIZE 361
 #define SIGLENT_DIG_HEADER_SIZE 346
 
 /* Maximum number of samples to retrieve at once. */
@@ -54,6 +54,7 @@ enum protocol_version {
 enum data_source {
 	DATA_SOURCE_SCREEN,
 	DATA_SOURCE_HISTORY,
+	DATA_SOURCE_READ_ONLY,
 };
 
 struct siglent_sds_vendor {
@@ -81,10 +82,11 @@ struct siglent_sds_model {
 	unsigned int digital_channels;
 };
 
+/* Wait events affect how the callback loop behaves */
 enum wait_events {
-	WAIT_NONE,	/* Don't wait */
-	WAIT_TRIGGER,	/* Wait for trigger */
-	WAIT_BLOCK,	/* Wait for block data (only when reading sample mem) */
+	WAIT_NONE,	/* Don't wait, proceed to read waveform data */
+	WAIT_TRIGGER,	/* Wait for trigger via INR, then proceed to WAIT_BLOCK */
+	WAIT_BLOCK,	/* Request and wait for block data (only when reading sample mem) */
 	WAIT_STOP,	/* Wait for scope stopping (only single shots) */
 };
 
@@ -153,6 +155,10 @@ struct dev_context {
 	unsigned char *buffer;
 	float *data;
 	GArray *dig_buffer;
+	/* General purpose retry counter for grafceful failure out of infinite loops and whatnot */
+	int retry_count;
+	/* If true, close history when done acquiring in history mode (E-X) */
+	gboolean close_history;
 };
 
 SR_PRIV int siglent_sds_config_set(const struct sr_dev_inst *sdi,

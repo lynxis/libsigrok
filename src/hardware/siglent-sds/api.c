@@ -155,8 +155,9 @@ static const uint64_t averages[] = {
 
 /* Do not change the order of entries. */
 static const char *data_sources[] = {
-	"Display",
+	"Single",
 	"History",
+	"Read-only",
 };
 
 enum vendor {
@@ -294,6 +295,12 @@ static struct sr_dev_inst *probe_device(struct sr_scpi_dev_inst *scpi)
 	sdi->serial_num = g_strdup(hw_info->serial_number);
 	devc = g_malloc0(sizeof(struct dev_context));
 	devc->limit_frames = 1;
+
+	// Set some pointers to null so they can be safely g_free'd later
+	for (i = 0; i < MAX_ANALOG_CHANNELS; i++) {
+		devc->coupling[i] = NULL;
+	}
+	devc->trigger_slope = NULL;
 	devc->model = model;
 
 	sr_scpi_hw_info_free(hw_info);
@@ -431,9 +438,11 @@ static int config_get(uint32_t key, GVariant **data,
 		break;
 	case SR_CONF_DATA_SOURCE:
 		if (devc->data_source == DATA_SOURCE_SCREEN)
-			*data = g_variant_new_string("Screen");
+			*data = g_variant_new_string("Single");
 		else if (devc->data_source == DATA_SOURCE_HISTORY)
 			*data = g_variant_new_string("History");
+		else if (devc->data_source == DATA_SOURCE_READ_ONLY)
+			*data = g_variant_new_string("Read-only");
 		break;
 	case SR_CONF_SAMPLERATE:
 		siglent_sds_get_dev_cfg_horizontal(sdi);
@@ -677,11 +686,16 @@ static int config_set(uint32_t key, GVariant *data,
 		return ret;
 	case SR_CONF_DATA_SOURCE:
 		tmp_str = g_variant_get_string(data, NULL);
-		if (!strcmp(tmp_str, "Display"))
+		if (!strcmp(tmp_str, "Single"))
 			devc->data_source = DATA_SOURCE_SCREEN;
 		else if (devc->model->series->protocol >= SPO_MODEL
 			&& !strcmp(tmp_str, "History"))
 			devc->data_source = DATA_SOURCE_HISTORY;
+
+		// Untested for earlier models, feel free to enable
+		else if (devc->model->series->protocol >= ESERIES
+			  && !strcmp(tmp_str, "Read-only"))
+			devc->data_source = DATA_SOURCE_READ_ONLY;
 		else {
 			sr_err("Unknown data source: '%s'.", tmp_str);
 			return SR_ERR;
@@ -698,7 +712,7 @@ static int config_set(uint32_t key, GVariant *data,
 	case SR_CONF_AVG_SAMPLES:
 		devc->average_samples = g_variant_get_uint64(data);
 		sr_dbg("Setting averaging rate to %" PRIu64, devc->average_samples);
-		break;	
+		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -801,12 +815,53 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	struct sr_channel *ch;
 	gboolean some_digital;
 	GSList *l, *d;
+	char *buf;
+	int len;
+	int retries;
+	char flush_buf[5];
+	int flush_count = -3;
 
 	scpi = sdi->conn;
 	devc = sdi->priv;
 
 	devc->num_frames = 0;
 	some_digital = FALSE;
+
+	/* Flush any leftover data from read buffers by doing a mock request
+	 * We use CHDR? as a dummy request and then read until we get OFF\n
+	 * This allows us to be fairly certain that the buffer is totally empty
+	 * before continuing.
+	*/
+
+	if (sr_scpi_send(scpi, ":CHDR?") != SR_OK)
+		return SR_ERR;
+	if (sr_scpi_read_begin(scpi) != SR_OK)
+		return SR_ERR;
+
+	memset(&flush_buf[0], ' ', sizeof(flush_buf));
+	flush_buf[4] = '\0';
+	do {
+		flush_buf[0] = flush_buf[1];
+		flush_buf[1] = flush_buf[2];
+		flush_buf[2] = flush_buf[3];
+		sr_dbg("Try to read 1 byte..");
+		len = sr_scpi_read_data(scpi, &flush_buf[3], 1);
+
+		if (len == -1) {
+			sr_err("Read error during flush.");
+			return SR_ERR;
+		} else if (len == 0) {
+			sr_err("Read empty during flush.");
+			return SR_ERR;
+		}
+		sr_dbg("Flush buf: %s", flush_buf);
+		if (g_strcmp0(flush_buf, "OFF\n") == 0) {
+			break;
+		}
+		flush_count++;
+
+	} while (1);
+	sr_dbg("Flushed %d bytes.", flush_count);
 
 	/*
 	 * Check if there are any logic channels enabled, if so then enable
@@ -888,8 +943,17 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		break;
 	}
 
-	sr_scpi_source_add(sdi->session, scpi, G_IO_IN, 7000,
-		siglent_sds_receive, (void *) sdi);
+	// Set the callback timeout, X-E has no trouble going in fast
+	switch (devc->model->series->protocol) {
+	case ESERIES:
+		sr_scpi_source_add(sdi->session, scpi, G_IO_IN, 10,
+			siglent_sds_receive, (void *) sdi);
+		break;
+	default:
+		sr_scpi_source_add(sdi->session, scpi, G_IO_IN, 7000,
+			siglent_sds_receive, (void *) sdi);
+		break;
+	}
 
 	std_session_send_df_header(sdi);
 
@@ -908,7 +972,7 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	struct sr_scpi_dev_inst *scpi;
-
+	int ret;
 	devc = sdi->priv;
 
 	std_session_send_df_end(sdi);
